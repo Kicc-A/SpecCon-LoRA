@@ -1,0 +1,10 @@
+torch
+transformers
+peft
+datasets
+accelerate
+deepspeed
+numpy
+tqdm
+wandb
+safetensors
