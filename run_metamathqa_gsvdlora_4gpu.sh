@@ -4,6 +4,8 @@ set -euo pipefail
 ROOT=/workspace/GSVD-LoRA
 SEED=${SEED:-42}
 CONSISTENCY_LAMBDA=${CONSISTENCY_LAMBDA:-1.0}
+CALIBRATION_STEPS=${CALIBRATION_STEPS:-128}
+CALIBRATION_BLOCKS=${CALIBRATION_BLOCKS:-4}
 EXP_NAME=${EXP_NAME:-llama31_metamathqa_gsvdlora_consensus_seed${SEED}_gpu0123}
 EXP=$ROOT/experiments/$EXP_NAME
 mkdir -p "$EXP/logs"
@@ -23,7 +25,7 @@ exec /root/anaconda3/envs/gslora/bin/deepspeed --num_gpus 4 \
   --target_modules q_proj k_proj v_proj o_proj \
   --base_rank 8 --r_min 4 --r_max 32 --rank_budget_mode param \
   --rank_score_gamma 1.0 \
-  --calibration_steps 128 --calibration_blocks 4 \
+  --calibration_steps "$CALIBRATION_STEPS" --calibration_blocks "$CALIBRATION_BLOCKS" \
   --subspace_consistency_lambda "$CONSISTENCY_LAMBDA" \
   --subspace_consistency_floor 0.05 \
   --spectral_oversample 8 --spectral_power_iterations 1 --spectral_seed 3407 \

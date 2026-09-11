@@ -34,4 +34,5 @@ class GSVDLoraConfig:
     rank_budget_mode: str = "independent"
     param_budget: Optional[int] = None
     rank_score_gamma: Union[float, str] = 1.0
+    rank_score_normalization: str = "none"
     attention_rank_prior: Union[float, str] = 1.0

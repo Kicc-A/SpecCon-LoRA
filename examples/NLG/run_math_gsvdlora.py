@@ -59,6 +59,7 @@ def parse_args():
     parser.add_argument("--lora_dropout", type=float, default=0.05)
     parser.add_argument("--use_lora_plus", action="store_true", help="Use LoRA+ style higher LR for LoRA B weights")
     parser.add_argument("--lora_plus_scaler", type=float, default=16.0, help="LR multiplier for LoRA B weights when LoRA+ is enabled")
+    parser.add_argument("--lora_fp32", action="store_true", help="Keep trainable LoRA A/B weights in FP32 under mixed precision")
     parser.add_argument("--init_method", choices=["none", "svd_sqrt", "svd_sigma", "svd_a_zero_b", "svd_a_energy_zero_b", "svd_a_energy_small_b"], default="svd_a_zero_b")
     parser.add_argument("--init_scale", type=str, default="1e-3")
     parser.add_argument("--init_auto_scale_min", type=float, default=0.3)
@@ -76,6 +77,12 @@ def parse_args():
     parser.add_argument("--spectral_power_iterations", type=int, default=1)
     parser.add_argument("--spectral_seed", type=int, default=3407)
     parser.add_argument("--rank_score_gamma", type=str, default="1.0")
+    parser.add_argument(
+        "--rank_score_normalization",
+        choices=["none", "target_module"],
+        default="none",
+        help="Normalize marginal rank scores within q/k/v/o target-module groups before budget allocation.",
+    )
     parser.add_argument("--attention_rank_prior", type=str, default="1.0")
     parser.add_argument("--skip_adaptive_rank", action="store_true")
     parser.add_argument("--max_length", type=int, default=512)
@@ -94,6 +101,8 @@ def parse_args():
     parser.add_argument("--learning_rate", type=float, default=2e-4)
     parser.add_argument("--weight_decay", type=float, default=0.0)
     parser.add_argument("--warmup_ratio", type=float, default=0.03)
+    parser.add_argument("--lr_scheduler", choices=["linear", "cosine"], default="linear")
+    parser.add_argument("--lr_decay_ratio", type=float, default=0.0)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
@@ -397,6 +406,17 @@ def build_trainable_param_groups(model, args):
     return param_groups
 
 
+def cast_lora_weights_to_fp32(model):
+    cast = []
+    for name, param in model.named_parameters():
+        if "lora_A" in name or "lora_B" in name or "weight_a" in name or "weight_b" in name:
+            param.data = param.data.float()
+            cast.append(name)
+    if not cast:
+        raise RuntimeError("--lora_fp32 was requested, but no LoRA parameters were found")
+    return cast
+
+
 def train(model, train_loader, args, device: torch.device):
     trainable_params = build_trainable_param_groups(model, args)
     optimizer = torch.optim.AdamW(trainable_params, lr=args.learning_rate, weight_decay=args.weight_decay)
@@ -487,15 +507,28 @@ def build_deepspeed_config(args, total_steps: int):
                 "torch_adam": True,
             },
         },
-        "scheduler": {
-            "type": "WarmupDecayLR",
-            "params": {
-                "total_num_steps": total_steps,
-                "warmup_min_lr": 0,
-                "warmup_max_lr": args.learning_rate,
-                "warmup_num_steps": warmup_steps,
-            },
-        },
+        "scheduler": (
+            {
+                "type": "WarmupCosineLR",
+                "params": {
+                    "total_num_steps": total_steps,
+                    "warmup_min_ratio": 0.0,
+                    "warmup_num_steps": warmup_steps,
+                    "cos_min_ratio": args.lr_decay_ratio,
+                    "warmup_type": "linear",
+                },
+            }
+            if args.lr_scheduler == "cosine"
+            else {
+                "type": "WarmupDecayLR",
+                "params": {
+                    "total_num_steps": total_steps,
+                    "warmup_min_lr": 0,
+                    "warmup_max_lr": args.learning_rate,
+                    "warmup_num_steps": warmup_steps,
+                },
+            }
+        ),
         "steps_per_print": 50,
         "wall_clock_breakdown": False,
     }
@@ -718,6 +751,7 @@ def main():
         spectral_power_iterations=args.spectral_power_iterations,
         spectral_seed=args.spectral_seed,
         rank_score_gamma=args.rank_score_gamma,
+        rank_score_normalization=args.rank_score_normalization,
         attention_rank_prior=args.attention_rank_prior,
         adaptive_rank=not args.skip_adaptive_rank,
         init_method=args.init_method,
@@ -741,6 +775,10 @@ def main():
         config=config,
         device=device,
     )
+    if args.lora_fp32:
+        cast_names = cast_lora_weights_to_fp32(model)
+        if is_main_process():
+            print(f"--->Kept {len(cast_names)} LoRA parameters in FP32")
     if is_main_process() and hasattr(model, "print_trainable_parameters"):
         model.print_trainable_parameters()
 
@@ -775,8 +813,10 @@ def main():
             with open(os.path.join(args.output_dir, "gsm8k_predictions.jsonl"), "w", encoding="utf-8") as f:
                 for item in predictions:
                     f.write(json.dumps(item, ensure_ascii=False) + "\n")
-        finish_wandb(args)
     barrier()
+    # Do not make non-zero ranks wait while rank 0 flushes W&B. Online W&B
+    # shutdown can block on a slow network long enough to trip NCCL's watchdog.
+    finish_wandb(args)
 
 
 if __name__ == "__main__":

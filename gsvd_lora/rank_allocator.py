@@ -84,6 +84,33 @@ def _target_module_leaf(name: str) -> str:
     return name.rsplit(".", 1)[-1]
 
 
+def _normalize_candidate_scores(candidates, mode: str):
+    if mode == "none":
+        return candidates
+    if mode != "target_module":
+        raise ValueError(f"Unsupported rank_score_normalization: {mode}")
+
+    grouped_positive_scores = {}
+    for score, _, _, name, _ in candidates:
+        if score > 0.0:
+            grouped_positive_scores.setdefault(_target_module_leaf(name), []).append(score)
+    group_means = {
+        group: sum(scores) / len(scores)
+        for group, scores in grouped_positive_scores.items()
+        if scores
+    }
+    return [
+        (
+            score / max(group_means.get(_target_module_leaf(name), 1.0), 1e-12),
+            marginal_energy,
+            rank_cost,
+            name,
+            rank_index,
+        )
+        for score, marginal_energy, rank_cost, name, rank_index in candidates
+    ]
+
+
 def _module_rank_prior(name: str, config, resolved_attention_prior: float = None) -> float:
     leaf = _target_module_leaf(name)
     if leaf in {"q", "k", "v", "o"}:
@@ -307,6 +334,9 @@ def allocate_global_param_budget_ranks(
             )
             candidates.append((score, marginal_energy, rank_cost, name, rank_index))
 
+    score_normalization = getattr(config, "rank_score_normalization", "none")
+    candidates = _normalize_candidate_scores(candidates, score_normalization)
+
     budget_arg = getattr(config, "param_budget", None)
     budget = int(budget_arg) if budget_arg is not None else base_cost
     budget = max(min_cost, min(budget, max_cost))
@@ -354,6 +384,7 @@ def allocate_global_param_budget_ranks(
             "budget_target": int(budget),
             "budget_base_rank_param_count": int(base_cost),
             "rank_score_gamma": float(resolved_gamma),
+            "rank_score_normalization": score_normalization,
             "attention_rank_prior": float(resolved_attention_prior),
             "module_rank_prior": float(_module_rank_prior(name, config, resolved_attention_prior)),
             "used_consensus_spectrum": bool(consensus_profile is not None),

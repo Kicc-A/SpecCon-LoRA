@@ -7,8 +7,8 @@ MODEL=${MODEL:-/workspace/MyTransformers/experiments/gora_gsm8k_vllm_loraga_tp4/
 DATASET=/workspace/MyTransformers/experiments/gora_gsm8k_vllm_loraga_tp4/data/gsm8k_official_1319.jsonl
 OUTPUT=${OUTPUT:-/workspace/MyTransformers/experiments/gora_gsm8k_vllm_loraga_tp4/result}
 
-export DATA_PARALLEL_WORLD_SIZE=1
-export TENSOR_PARALLEL_WORLD_SIZE=4
+export DATA_PARALLEL_WORLD_SIZE="${DATA_PARALLEL_WORLD_SIZE:-1}"
+export TENSOR_PARALLEL_WORLD_SIZE="${TENSOR_PARALLEL_WORLD_SIZE:-4}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
 export PYTHONPATH=/workspace/MyTransformers
 
