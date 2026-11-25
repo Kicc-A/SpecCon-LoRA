@@ -1,0 +1,104 @@
+--- /workspace/SpecCon-LoRA/experiments/small_glue_rdrop_dropout_labelsmoothing_3seeds_gpu23_20261008_v1/source_snapshot/reproduction/run_roberta_small_glue_regularization.py
++++ /workspace/SpecCon-LoRA/experiments/extended_ablation_20261021_v2/source_snapshot/mrpc/seed777/reproduction/run_roberta_small_glue_regularization.py
+@@ -23,6 +23,7 @@
+ from transformers import AutoModelForSequenceClassification, AutoTokenizer, DataCollatorWithPadding, get_linear_schedule_with_warmup, get_cosine_schedule_with_warmup
+ 
+ from speccon_lora import SpecConLoraConfig, prepare_specconlora_model
++from extended_ablation_support import prepare_extended, read_spec
+ 
+ MODEL_PATH = "/workspace/Models/RoBERTa-base"
+ DATA_ROOT = Path("/workspace/datasets/glue")
+@@ -74,6 +75,11 @@
+     parser.add_argument("--scheduler-epochs", type=int, default=None,
+                         help="Fixed LR schedule horizon; defaults to the training epoch budget")
+     parser.add_argument("--smoke-epochs", type=int, default=1)
++    parser.add_argument("--ablation-variant", choices=list("ABCDEF"), required=True)
++    parser.add_argument("--allocation-reference", type=Path, required=True)
++    parser.add_argument("--expected-allocation", type=Path)
++    parser.add_argument("--subspace-consistency-lambda", type=float, default=1.5)
++    parser.add_argument("--extension-spec", type=Path, required=True)
+     args = parser.parse_args()
+     if not math.isfinite(args.label_smoothing) or not 0 <= args.label_smoothing < 1:
+         parser.error("--label-smoothing must be finite and in [0, 1)")
+@@ -189,7 +195,10 @@
+ 
+ 
+ def main():
++    global PARAM_BUDGET
+     args = parse_args(); cfg = dict(TASK_CONFIG[args.task]); output = Path(args.output_dir)
++    extra_spec = read_spec(args.extension_spec)
++    PARAM_BUDGET = extra_spec["budget"]
+     if output.exists() and any(output.iterdir()):
+         raise RuntimeError(f"Refusing to overwrite nonempty output: {output}")
+     output.mkdir(parents=True, exist_ok=True)
+@@ -201,11 +210,14 @@
+     cfg["rdrop_alpha"] = args.rdrop_alpha
+     cfg["label_smoothing"] = args.label_smoothing
+     cfg["rdrop_kl_reduction"] = "class_sum_batch_mean_bidirectional_average"
+-    cfg["training_forwards_per_step"] = 2 if args.rdrop_alpha > 0 else 1
++    cfg["training_forwards_per_step"] = 2 if (args.rdrop_alpha > 0 or extra_spec["two_forwards"]) else 1
+     cfg["scheduler_epochs"] = args.smoke_epochs if args.smoke else (args.scheduler_epochs or cfg["epochs"])
+     calibration_steps = args.calibration_steps if args.calibration_steps is not None else (4 if args.smoke else 16)
+-    cfg["calibration_steps"] = calibration_steps
+-    cfg["calibration_blocks"] = 4
++    cfg["ablation_variant"] = args.ablation_variant
++    cfg["adapter_parameter_budget"] = PARAM_BUDGET
++    cfg["calibration_steps"] = extra_spec["steps"]
++    cfg["calibration_blocks"] = extra_spec["blocks"]
++    cfg["extension"] = extra_spec
+     cfg["training_rng_reference"] = str(args.training_rng_reference) if args.training_rng_reference else None
+     atomic_json(output / "run_config.json", {
+         "task": args.task, "seed": args.seed, "config": cfg, "lora_dropout": args.lora_dropout,
+@@ -236,14 +248,15 @@
+         target_modules=["query", "key", "value", "dense"], target_prefix="roberta.encoder.layer",
+         base_rank=8, r_min=2, r_max=16, lora_alpha=2, lora_dropout=args.lora_dropout,
+         calibration_steps=calibration_steps, calibration_blocks=4, use_subspace_consistency=True,
+-        subspace_consistency_lambda=1.5, subspace_consistency_floor=0.05,
++        subspace_consistency_lambda=args.subspace_consistency_lambda, subspace_consistency_floor=0.05,
+         spectral_oversample=8, spectral_power_iterations=1, spectral_seed=3407,
+         init_method="svd_a_zero_b", init_scale=1.0, init_energy_beta=0.5,
+         init_energy_eps=1e-8, init_small_b_scale=1e-4, scaling_mode="constant",
+         rank_budget_mode="param", param_budget=PARAM_BUDGET, strict_param_budget=True,
+         rank_score_gamma=1.2, attention_rank_prior=1.0,
+     )
+-    model, report = prepare_specconlora_model(model, calibration_loader, loss_fn, speccon, device=device)
++    model, report = prepare_extended(model, calibration_loader, loss_fn, speccon,
++        device, args.extension_spec, args.allocation_reference, output)
+     # Training sets each layer's scaling directly. Encode the same alpha/r in
+     # PEFT metadata so a normal from_pretrained reproduces training inference.
+     peft_config = model.peft_config["default"]
+@@ -270,6 +283,8 @@
+     lora_b = [param for name, param in trainable if "lora_B" in name]
+     if len(lora_a) + len(lora_b) != len(trainable) or not lora_a or not lora_b: raise RuntimeError("LoRA+ grouping failed")
+ 
++    if args.smoke:
++        train_dataset = train_dataset.select(range(min(128, len(train_dataset))))
+     epochs = args.smoke_epochs if args.smoke else cfg["epochs"]
+     steps_per_epoch = math.ceil(len(train_dataset) / 32); total_steps = steps_per_epoch * epochs
+     scheduler_steps = steps_per_epoch * cfg["scheduler_epochs"]
+@@ -306,7 +321,7 @@
+         for batch in loader:
+             batch = {key: value.to(device) for key, value in batch.items()}; optimizer.zero_grad(set_to_none=True)
+             result = model(**batch)
+-            second = model(**batch) if args.rdrop_alpha > 0 else None
++            second = model(**batch) if (args.rdrop_alpha > 0 or extra_spec["two_forwards"]) else None
+             loss, ce, kl = rdrop_loss(result, second, args.rdrop_alpha, batch["labels"], args.label_smoothing)
+             if not torch.isfinite(loss): raise RuntimeError("Non-finite loss")
+             loss.backward(); grad_norm = torch.nn.utils.clip_grad_norm_([param for _, param in trainable], cfg["clip"], error_if_nonfinite=True)
+@@ -333,12 +348,13 @@
+     model.save_pretrained(output / "final_adapter")
+     tokenizer.save_pretrained(output / "final_adapter")
+     result = {
+-        "state": "complete", "task": args.task, "seed": args.seed, "model": "RoBERTa-base", "method": "SpecCon-LoRA",
++        "state": "complete", "task": args.task, "seed": args.seed, "model": "RoBERTa-base", "method": "ExtendedAblation-" + extra_spec["name"],
+         "precision": "FP32", "visible_gpus": os.environ.get("CUDA_VISIBLE_DEVICES", ""),
+         "gpu_count": 1, "global_batch_size": 32,
+         "epochs": len(history), "planned_epochs": epochs, "stopped_early": False, "optimizer_steps": global_step, "adapter_parameters": PARAM_BUDGET,
+-        "hyperparameters": {**cfg, "rank_range": [2, 16], "init_method": "svd_a_zero_b",
+-                            "gamma": 1.2, "lambda": 1.5, "dropout": args.lora_dropout,
++        "hyperparameters": {**cfg, "rank_range": [speccon.r_min, speccon.r_max], "init_method": speccon.init_method,
++                            "gamma": None if args.ablation_variant in "AB" else speccon.rank_score_gamma,
++                            "lambda": None if args.ablation_variant in "AB" else speccon.subspace_consistency_lambda, "dropout": args.lora_dropout,
+                             "scheduler_epochs": cfg["scheduler_epochs"],
+                             "scaling": 2.0, "lora_plus_ratio": 1.0,
+                             "lr_a": lr_a, "lr_b": lr_b},

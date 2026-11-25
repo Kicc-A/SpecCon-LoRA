@@ -1,11 +1,11 @@
 import torch
 
-from gsvd_lora.config import GSVDLoraConfig
-from gsvd_lora.consensus import build_consensus_spectral_profiles
+from speccon_lora.config import SpecConLoraConfig
+from speccon_lora.consensus import build_consensus_spectral_profiles
 
 
 def _config():
-    return GSVDLoraConfig(
+    return SpecConLoraConfig(
         target_modules=["q_proj"],
         r_max=2,
         subspace_consistency_floor=0.0,

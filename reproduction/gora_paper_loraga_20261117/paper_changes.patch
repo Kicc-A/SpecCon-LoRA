@@ -1,0 +1,126 @@
+diff --git a/common/lora_modules/__init__.py b/common/lora_modules/__init__.py
+index f5336e2..62dffb9 100644
+--- a/common/lora_modules/__init__.py
++++ b/common/lora_modules/__init__.py
+@@ -26,7 +26,6 @@ from common.lora_modules.goat import *
+ from common.lora_modules.lora_one import *
+ from common.lora_modules.vera import *
+ from common.lora_modules.eva import *
+-from common.lora_modules.rasa_moe import *
+ from common.lora_modules.dralora import dralora_reinit
+ 
+ @contextlib.contextmanager
+@@ -221,4 +220,4 @@ def prepare_lora_for_inference(model, args):
+ 
+     # Check for shared weights
+     if check_shared_lora_weights_required(args):
+-        insert_shared_lora_weights(model, args)
+\ No newline at end of file
++        insert_shared_lora_weights(model, args)
+diff --git a/common/lora_modules/gora.py b/common/lora_modules/gora.py
+index 2356796..d1af955 100644
+--- a/common/lora_modules/gora.py
++++ b/common/lora_modules/gora.py
+@@ -181,7 +181,8 @@ class LinearWithGoRA(LinearWithQLoRA):
+             stable_gemma = (lr / math.sqrt(self.lora_rank/self.in_features)) * (self.scale_rank)
+         weight_b_data *= (stable_gemma / self.scaling_alpha)
+ 
+-        self.weight_b = nn.Parameter(weight_b_data.contiguous())
++        # Paper Eq. (9): the adapter starts along the negative loss gradient.
++        self.weight_b = nn.Parameter(-weight_b_data.contiguous())
+         reconstruction_error = torch.norm(-grad_stored*lr - self._compute_lora_weight(), p='fro')
+         relative_error = reconstruction_error / torch.norm(grad_stored, p='fro')
+         self.register_buffer("error", reconstruction_error)
+@@ -368,8 +369,9 @@ def get_allocated_rank(model, args, prev_importances=None):
+                 normalized_importances = get_normalized_importances(args, importances_tensor)
+ 
+             for name, normalized_importance in zip(named_importances.keys(), normalized_importances):
+-                smooth_trainable = allocate_func(smooth_total_budget * normalized_importance.item())
+-                rank = smooth_trainable // named_smooth_features[name]
++                # Paper Eq. (8): round only after dividing the layer budget
++                # by its smoothed parameter cost.
++                rank = smooth_total_budget * normalized_importance.item() / named_smooth_features[name]
+                 if args.gora_max_rank and args.gora_min_rank:
+                     named_ranks[name] = min(max(allocate_func(rank), args.gora_min_rank), args.gora_max_rank)
+                 else:
+@@ -445,10 +447,14 @@ def gora_dynamic_init(model, args, named_ranks, batch):
+ 
+                 if args.world_size > 1:
+                     torch.distributed.barrier()
+-                    grad_stored = module.weight.grad_stored.to(args.device) if args.global_rank == 0 else torch.zeros_like(module.weight).to(args.device)
++                    grad_stored = module.weight.grad_stored.to(args.device) if args.global_rank == 0 else torch.zeros_like(module.weight, dtype=torch.float32).to(args.device)
+                     torch.distributed.broadcast(grad_stored, src=0)
+                     module.weight.grad_stored = grad_stored
+                 module.dynamic_init(args.lora_rank, named_ranks[name], gora_stable_gemma, gora_scale_by_lr, lr=args.gora_lr)
++                if args.world_size > 1:
++                    # Paper Algorithm 2: every worker starts with identical A/B.
++                    torch.distributed.broadcast(module.weight_a.data, src=0)
++                    torch.distributed.broadcast(module.weight_b.data, src=0)
+                 # Clear grad_stored for this layer
+                 module.weight.grad_stored = None
+                 torch.cuda.empty_cache()
+@@ -518,7 +524,7 @@ def gora_reinit(
+             optimizer.save_gradient_to_cpu = True
+         else:
+             hooks = [
+-                module.weight.register_hook(get_record_gradient_hook(model, args.world_size, args.global_rank))
++                module.weight.register_post_accumulate_grad_hook(get_record_gradient_hook(model, args.world_size, args.global_rank))
+                 for module in model.modules()
+                 if isinstance(module, LinearWithGoRA)
+             ]
+@@ -612,4 +618,4 @@ def gora_reinit(
+ 
+         print_rank_0(f'error: {error/count}, relative error: {relative_error/count}', args.global_rank)
+ 
+-    print_rank_0(f'--->Total time consumed for GoRA initialization: {timer.time_cost}, Peak memory used: {timer.peak_memory}MB', args.global_rank)
+\ No newline at end of file
++    print_rank_0(f'--->Total time consumed for GoRA initialization: {timer.time_cost}, Peak memory used: {timer.peak_memory}MB', args.global_rank)
+diff --git a/common/lora_modules/grad_utils.py b/common/lora_modules/grad_utils.py
+index 36eb675..175aa81 100644
+--- a/common/lora_modules/grad_utils.py
++++ b/common/lora_modules/grad_utils.py
+@@ -4,21 +4,22 @@ import torch.distributed as dist
+ from common.utils.utils import reduce_tensor
+ 
+ def get_record_gradient_hook(model, world_size=1, rank=0):
+-    def record_gradient_hook(grad):
+-        torch.cuda.synchronize()
+-        for p in model.parameters():
+-            if p.requires_grad and p.grad is not None:
+-                if world_size > 1:
+-                    p.grad = reduce_tensor(p.grad, world_size)
+-                if rank == 0:
+-                    if not hasattr(p, 'grad_stored'):
+-                        p.grad_stored = p.grad.detach().cpu()
+-                        p.iters = 1
+-                    else:
+-                        p.grad_stored += p.grad.detach().cpu()
+-                        p.iters += 1
+-                p.grad = None  # Clear GPU gradient immediately
+-        return grad
++    def record_gradient_hook(p):
++        # Called after this parameter's gradient has been accumulated. Record
++        # exactly one FP32 contribution per calibration step and target weight.
++        grad = p.grad.detach().float()
++        if world_size > 1:
++            dist.all_reduce(grad)
++            grad.div_(world_size)
++        if rank == 0:
++            value = grad.cpu()
++            if not hasattr(p, 'grad_stored'):
++                p.grad_stored = value.clone()
++                p.iters = 1
++            else:
++                p.grad_stored.add_(value)
++                p.iters += 1
++        p.grad = None
+     return record_gradient_hook
+ 
+ 
+@@ -43,4 +44,4 @@ def broadcast_object(args, broadcast_data=None):
+         serialized = bytes(data.cpu().tolist())
+         broadcast_data = pickle.loads(serialized)
+     
+-    return broadcast_data
+\ No newline at end of file
++    return broadcast_data

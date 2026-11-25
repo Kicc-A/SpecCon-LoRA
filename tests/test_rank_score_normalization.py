@@ -1,6 +1,6 @@
 import pytest
 
-from gsvd_lora.rank_allocator import _normalize_candidate_scores
+from speccon_lora.rank_allocator import _normalize_candidate_scores
 
 
 def test_target_module_normalization_equalizes_group_means():

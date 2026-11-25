@@ -1,0 +1,39 @@
+--- /workspace/SpecCon-LoRA/experiments/small_glue_rdrop_dropout_labelsmoothing_3seeds_gpu23_20261008_v1/source_snapshot/reproduction/run_roberta_small_glue_regularization.py
++++ source_snapshot/reproduction/run_roberta_small_glue_regularization.py
+@@ -74,7 +74,10 @@
+     parser.add_argument("--scheduler-epochs", type=int, default=None,
+                         help="Fixed LR schedule horizon; defaults to the training epoch budget")
+     parser.add_argument("--smoke-epochs", type=int, default=1)
++    parser.add_argument("--subspace-consistency-lambda", type=float, default=1.5)
+     args = parser.parse_args()
++    if not math.isfinite(args.subspace_consistency_lambda) or args.subspace_consistency_lambda < 0:
++        parser.error("--subspace-consistency-lambda must be finite and nonnegative")
+     if not math.isfinite(args.label_smoothing) or not 0 <= args.label_smoothing < 1:
+         parser.error("--label-smoothing must be finite and in [0, 1)")
+     if not math.isfinite(args.rdrop_alpha) or args.rdrop_alpha < 0:
+@@ -210,6 +213,7 @@
+     atomic_json(output / "run_config.json", {
+         "task": args.task, "seed": args.seed, "config": cfg, "lora_dropout": args.lora_dropout,
+         "smoke": args.smoke, "scheduler_epochs": cfg["scheduler_epochs"],
++        "subspace_consistency_lambda": args.subspace_consistency_lambda,
+         "selection": "fixed final epoch; best checkpoint is diagnostic only",
+         "source_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+     })
+@@ -236,7 +240,7 @@
+         target_modules=["query", "key", "value", "dense"], target_prefix="roberta.encoder.layer",
+         base_rank=8, r_min=2, r_max=16, lora_alpha=2, lora_dropout=args.lora_dropout,
+         calibration_steps=calibration_steps, calibration_blocks=4, use_subspace_consistency=True,
+-        subspace_consistency_lambda=1.5, subspace_consistency_floor=0.05,
++        subspace_consistency_lambda=args.subspace_consistency_lambda, subspace_consistency_floor=0.05,
+         spectral_oversample=8, spectral_power_iterations=1, spectral_seed=3407,
+         init_method="svd_a_zero_b", init_scale=1.0, init_energy_beta=0.5,
+         init_energy_eps=1e-8, init_small_b_scale=1e-4, scaling_mode="constant",
+@@ -338,7 +342,7 @@
+         "gpu_count": 1, "global_batch_size": 32,
+         "epochs": len(history), "planned_epochs": epochs, "stopped_early": False, "optimizer_steps": global_step, "adapter_parameters": PARAM_BUDGET,
+         "hyperparameters": {**cfg, "rank_range": [2, 16], "init_method": "svd_a_zero_b",
+-                            "gamma": 1.2, "lambda": 1.5, "dropout": args.lora_dropout,
++                            "gamma": 1.2, "lambda": args.subspace_consistency_lambda, "dropout": args.lora_dropout,
+                             "scheduler_epochs": cfg["scheduler_epochs"],
+                             "scaling": 2.0, "lora_plus_ratio": 1.0,
+                             "lr_a": lr_a, "lr_b": lr_b},

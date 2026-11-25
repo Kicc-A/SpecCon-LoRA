@@ -1,8 +1,8 @@
-# GSVD-LoRA
+# SpecCon-LoRA
 
-GSVD-LoRA is a clean research implementation of **budget-constrained LoRA rank allocation by cross-block gradient subspace consensus and cost-aware marginal spectral utility**.
+SpecCon-LoRA is a clean research implementation of **budget-constrained LoRA rank allocation by cross-block gradient subspace consensus and cost-aware marginal spectral utility**.
 
-It is intentionally separate from `/workspace/GS-LoRA`. The existing GS-LoRA code and results are not modified.
+Current experiments and launchers are documented in [CURRENT_GLUE.md](CURRENT_GLUE.md). The two retained historical math/code results are indexed in [BEST_NLG_RESULTS.md](BEST_NLG_RESULTS.md).
 
 ## Core idea
 
@@ -40,49 +40,30 @@ sum_i r_i * (d_in_i + d_out_i) <= sum_i 8 * (d_in_i + d_out_i)
 
 ## Difference from nearby methods
 
-- GoRA uses a matrix-level gradient/weight importance to map budget to layer ranks. GSVD-LoRA scores every incremental singular direction.
-- IGU-LoRA uses integrated-gradient sensitivity with EMA/deviation uncertainty. GSVD-LoRA uses a one-shot, pre-training, cross-block projector-overlap statistic.
-- AdaLoRA/DoRA prune rank components during training. GSVD-LoRA allocates once before training and keeps ordinary PEFT compatibility.
-- LoRA-GA focuses on gradient-aligned initialization. GSVD-LoRA uses spectral initialization as a secondary component; the allocator is the main method.
+- GoRA uses a matrix-level gradient/weight importance to map budget to layer ranks. SpecCon-LoRA scores every incremental singular direction.
+- IGU-LoRA uses integrated-gradient sensitivity with EMA/deviation uncertainty. SpecCon-LoRA uses a one-shot, pre-training, cross-block projector-overlap statistic.
+- AdaLoRA/DoRA prune rank components during training. SpecCon-LoRA allocates once before training and keeps ordinary PEFT compatibility.
+- LoRA-GA focuses on gradient-aligned initialization. SpecCon-LoRA uses spectral initialization as a secondary component; the allocator is the main method.
 
 ## Layout
 
-- `gsvd_lora/consensus.py`: deterministic randomized SVD and cross-block projector agreement.
-- `gsvd_lora/calibration.py`: blockwise calibration without retaining full gradients for every block.
-- `gsvd_lora/rank_allocator.py`: marginal spectral utility and exact parameter budget.
-- `gsvd_lora/init.py`: optional SVD initialization and rank-aware scaling.
-- `examples/NLG/run_math_gsvdlora.py`: MetaMathQA training.
-- `run_gsvdlora_glue_t5.py`: GLUE training.
-- `evaluation/`: the retained four-GPU vLLM + LoRA-GA-style GSM8K extraction protocol.
-
-## MetaMathQA
-
-```bash
-cd /workspace/GSVD-LoRA
-SEED=42 CONSISTENCY_LAMBDA=1.0 bash run_metamathqa_gsvdlora_4gpu.sh
-```
-
-The script matches the current GS-LoRA/GoRA comparison settings: Llama-3.1-8B-Base, MetaMathQA 100k, `q/k/v/o`, reference rank 8, rank range 4-32, alpha 16, sqrt-rank scaling, LoRA+, one epoch, and four GPUs. The intended first ablation is `CONSISTENCY_LAMBDA=0`, which retains block-mean spectral energy but removes subspace agreement.
+- `speccon_lora/consensus.py`: deterministic randomized SVD and cross-block projector agreement.
+- `speccon_lora/calibration.py`: blockwise calibration without retaining full gradients for every block.
+- `speccon_lora/rank_allocator.py`: marginal spectral utility and exact parameter budget.
+- `speccon_lora/init.py`: optional SVD initialization and rank-aware scaling.
+- `reproduction/run_current_glue.py`: retained RoBERTa GLUE runs; see [CURRENT_GLUE.md](CURRENT_GLUE.md).
+- `reproduction/launch_rte_qnli_lambda15_20261015.py`: current RTE/QNLI lambda=1.5 experiment.
+- `experiments/`: current GLUE runs and retained historical results.
+- `BEST_NLG_RESULTS.md`: the best recorded MetaMathQA and CodeFeedback runs, with adapters, merged models and evaluation outputs.
 
 ## GLUE
 
 ```bash
-TASKS="mnli sst2 cola qnli mrpc" SEEDS=42 bash run_glue_gsvdlora.sh
+/root/anaconda3/bin/python reproduction/run_current_glue.py \
+  --task cola --gpu 0 --output-root /workspace/glue_rerun --dry-run
 ```
 
-## Evaluation
-
-Merge with the training scaling before vLLM evaluation:
-
-```bash
-python evaluation/merge_adapter.py \
-  --adapter EXP/output/last_adapter \
-  --output EXP/eval/merged_hf \
-  --runtime-template /workspace/MyTransformers/experiments/gora_gsm8k_vllm_loraga_tp4/merged_hf \
-  --scaling-mode sqrt_rank
-MODEL=EXP/eval/merged_hf OUTPUT=EXP/eval/result \
-  bash evaluation/run_gsm8k_vllm_loraga.sh
-```
+Historical NLG launch/evaluation scripts and discarded GoRA-protocol reproduction outputs were removed on 2026-10-15. Retained NLG predictions and models remain in their original directories. Shared method code, datasets, base models, DPLoRA comparisons and the independent MT-Bench experiment snapshot are preserved.
 
 ## Fair-comparison protocol
 
@@ -90,8 +71,8 @@ Keep base model, data, target modules, reference parameter budget, optimizer, sc
 
 1. uniform rank-8 LoRA;
 2. GoRA;
-3. GSVD-LoRA with `lambda=0`;
-4. GSVD-LoRA with `lambda=1`;
+3. SpecCon-LoRA with `lambda=0`;
+4. SpecCon-LoRA with `lambda=1`;
 5. optionally energy-magnitude stability as a separate ablation.
 
 Choose `lambda`, `gamma`, and block count on a development split, not GSM8K test accuracy.
